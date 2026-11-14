@@ -31,7 +31,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define STEPS_PER_DIRECTION  5000U
+#define STEPS_PER_DIRECTION_RAMPING 	100U
+#define STEPS_PER_DIRECTION 			5000U
+#define MAX_RAMPING_FACTOR			32U
 
 /* USER CODE END PD */
 
@@ -48,7 +50,10 @@ TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 volatile uint32_t step_count = 0;   /* shared with ISR, so volatile */
+volatile uint32_t ramping_factor = 32;
 
+volatile int ramping_up = 1;
+volatile int ramping_down = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -104,6 +109,9 @@ int main(void)
   /* _IT version: PWM output plus a CC1 interrupt each time a pulse ends */
   HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start_IT(&htim2, TIM_CHANNEL_1);
+
+  // At the start of ramp-up, set the frequency of TIM1 to 32x slower than its normal speed (ARR * 32)
+  __HAL_TIM_SET_AUTORELOAD(&htim1, ((htim1.Init.Period + 1) * ramp_factor) - 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -386,9 +394,34 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
     step_count++;
+
+    // Ramp-up and ramp-down
+    if (step_count >= STEPS_PER_DIRECTION_RAMPING)
+    {
+    		if (ramping_up)
+    		{
+			step_count = 0;
+			ramping_factor >> 1; // half the ramping factor after every 100 steps during the ramping-up period
+			__HAL_TIM_SET_AUTORELOAD(&htim1, ((htim1.Init.Period + 1) * ramp_factor) - 1);
+			if (ramping_factor <= 1)
+				ramping_up = 0;
+    		}
+
+    		if (ramping_down)
+    		{
+    			step_count = 0;
+    			ramping_factor << 1; // double the ramping factor every 100 steps during the ramping-down period
+    			__HAL_TIM_SET_AUTORELOAD(&htim1, ((htim1.Init.Period + 1) * ramp_factor) - 1);
+    			if (ramping_factor >= MAX_RAMPING_FACTOR)
+    				ramping_down = 0;
+    		}
+    }
+
+    // Normal movement
     if (step_count >= STEPS_PER_DIRECTION)
     {
       step_count = 0;
+      ramping_down = 1;
       HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* DIR+ */
     }
   }
