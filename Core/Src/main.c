@@ -34,6 +34,10 @@
 #define STEPS_PER_DIRECTION_RAMPING 	100U
 #define STEPS_PER_DIRECTION 			5000U
 #define MAX_RAMPING_FACTOR			32U
+/* Base step period in timer ticks at 1 MHz (PSC = 71): 1000 ticks = 1 ms = 1 kHz.
+   Must match TIM1 Period (999) + 1 in CubeMX. Kept as a constant because
+   __HAL_TIM_SET_AUTORELOAD also overwrites htim1.Init.Period. */
+#define STEP_BASE_PERIOD_TICKS		1000U
 
 /* USER CODE END PD */
 
@@ -49,11 +53,16 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
-volatile uint32_t step_count = 0;   /* shared with ISR, so volatile */
-volatile uint32_t ramping_factor = 32;
+typedef enum
+{
+  MOTION_RAMP_UP,     /* factor 32 -> 16 -> 8 -> 4 -> 2, 100 steps each      */
+  MOTION_CRUISE,      /* factor 1 (1 kHz) for STEPS_PER_DIRECTION steps     */
+  MOTION_RAMP_DOWN    /* factor 2 -> 4 -> 8 -> 16 -> 32, 100 steps each      */
+} motion_state_t;
 
-volatile int ramping_up = 1;
-volatile int ramping_down = 0;
+volatile motion_state_t motion_state = MOTION_RAMP_UP;
+volatile uint32_t step_count = 0;                     /* shared with ISR, so volatile */
+volatile uint32_t ramping_factor = MAX_RAMPING_FACTOR; /* 1 = full speed, 32 = slowest */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -63,6 +72,7 @@ static void MX_DAC1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
+static void set_step_period(uint32_t factor);
 
 /* USER CODE END PFP */
 
@@ -106,12 +116,13 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
 
+  /* Start ramp-up at 32x slower than normal (ARR = 1000*32 - 1 = 31999, fits in 16 bits).
+     Done BEFORE starting the timer so the very first step is already slow. */
+  set_step_period(ramping_factor);
+
   /* _IT version: PWM output plus a CC1 interrupt each time a pulse ends */
   HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start_IT(&htim2, TIM_CHANNEL_1);
-
-  // At the start of ramp-up, set the frequency of TIM1 to 32x slower than its normal speed (ARR * 32)
-  __HAL_TIM_SET_AUTORELOAD(&htim1, ((htim1.Init.Period + 1) * ramp_factor) - 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -385,9 +396,28 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /**
+  * Set TIM1's step period to `factor` times the normal 1 ms period.
+  * factor = 1 -> 1 kHz, factor = 32 -> 31.25 Hz.
+  * Called from the CC1 callback, where CNT ~= 500 and the new ARR is always
+  * >= 999, so the counter can never be past the new ARR (no 0xFFFF wrap).
+  */
+static void set_step_period(uint32_t factor)
+{
+  /* Do NOT use htim1.Init.Period here: the macro below overwrites it with the
+     scaled value, so the factors would compound (31999 -> 511999 -> ...). */
+  __HAL_TIM_SET_AUTORELOAD(&htim1, (STEP_BASE_PERIOD_TICKS * factor) - 1U);
+}
+
+/**
   * Called on TIM1 CH1 compare match, i.e. the falling edge of each STEP pulse.
-  * Toggling DIR here (not at the rising edge) gives the driver ~500 us of
+  * Toggling DIR here (not at the rising edge) gives the driver plenty of
   * DIR setup time before the next step.
+  *
+  * One full cycle per direction:
+  *   RAMP_UP   : 100 steps each at 32x, 16x, 8x, 4x, 2x slower
+  *   CRUISE    : 5000 steps at 1 kHz
+  *   RAMP_DOWN : 100 steps each at 2x, 4x, 8x, 16x, 32x slower
+  *   -> toggle DIR (while slowest) -> back to RAMP_UP
   */
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
@@ -395,34 +425,54 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
   {
     step_count++;
 
-    // Ramp-up and ramp-down
-    if (step_count >= STEPS_PER_DIRECTION_RAMPING)
+    switch (motion_state)
     {
-    		if (ramping_up)
-    		{
-			step_count = 0;
-			ramping_factor >> 1; // half the ramping factor after every 100 steps during the ramping-up period
-			__HAL_TIM_SET_AUTORELOAD(&htim1, ((htim1.Init.Period + 1) * ramp_factor) - 1);
-			if (ramping_factor <= 1)
-				ramping_up = 0;
-    		}
+      case MOTION_RAMP_UP:
+        if (step_count >= STEPS_PER_DIRECTION_RAMPING)
+        {
+          step_count = 0;
+          ramping_factor >>= 1;              /* double the frequency */
+          set_step_period(ramping_factor);
+          if (ramping_factor <= 1U)
+          {
+            ramping_factor = 1U;
+            motion_state = MOTION_CRUISE;    /* now at 1 kHz */
+          }
+        }
+        break;
 
-    		if (ramping_down)
-    		{
-    			step_count = 0;
-    			ramping_factor << 1; // double the ramping factor every 100 steps during the ramping-down period
-    			__HAL_TIM_SET_AUTORELOAD(&htim1, ((htim1.Init.Period + 1) * ramp_factor) - 1);
-    			if (ramping_factor >= MAX_RAMPING_FACTOR)
-    				ramping_down = 0;
-    		}
-    }
+      case MOTION_CRUISE:
+        if (step_count >= STEPS_PER_DIRECTION)
+        {
+          step_count = 0;
+          ramping_factor <<= 1;              /* first ramp-down stage: half speed */
+          set_step_period(ramping_factor);
+          motion_state = MOTION_RAMP_DOWN;
+        }
+        break;
 
-    // Normal movement
-    if (step_count >= STEPS_PER_DIRECTION)
-    {
-      step_count = 0;
-      ramping_down = 1;
-      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* DIR+ */
+      case MOTION_RAMP_DOWN:
+        if (step_count >= STEPS_PER_DIRECTION_RAMPING)
+        {
+          step_count = 0;
+          if (ramping_factor >= MAX_RAMPING_FACTOR)
+          {
+            /* Finished 100 steps at the slowest speed: reverse and ramp up again.
+               ARR is already at 32x, so ramp-up starts at the right speed. */
+            ramping_factor = MAX_RAMPING_FACTOR;
+            HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* DIR */
+            motion_state = MOTION_RAMP_UP;
+          }
+          else
+          {
+            ramping_factor <<= 1;            /* halve the frequency */
+            set_step_period(ramping_factor);
+          }
+        }
+        break;
+
+      default:
+        break;
     }
   }
 }
