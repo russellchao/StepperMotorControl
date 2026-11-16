@@ -31,8 +31,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define STEPS_PER_DIRECTION_RAMPING 	100U
-#define STEPS_PER_DIRECTION 			5000U
+#define STEPS_PER_DIRECTION_RAMPING 	50U
+#define STEPS_PER_DIRECTION 			3000U
 #define MAX_RAMPING_FACTOR			32U
 /* Base step period in timer ticks at 1 MHz (PSC = 71): 1000 ticks = 1 ms = 1 kHz.
    Must match TIM1 Period (999) + 1 in CubeMX. Kept as a constant because
@@ -414,9 +414,9 @@ static void set_step_period(uint32_t factor)
   * DIR setup time before the next step.
   *
   * One full cycle per direction:
-  *   RAMP_UP   : 100 steps each at 32x, 16x, 8x, 4x, 2x slower
-  *   CRUISE    : 5000 steps at 1 kHz
-  *   RAMP_DOWN : 100 steps each at 2x, 4x, 8x, 16x, 32x slower
+  *   RAMP_UP   : 50 steps each at 32x, 16x, 8x, 4x, 2x slower
+  *   CRUISE    : 3000 steps at 1 kHz
+  *   RAMP_DOWN : 50 steps each at 2x, 4x, 8x, 16x, 32x slower
   *   -> toggle DIR (while slowest) -> back to RAMP_UP
   */
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
@@ -457,7 +457,7 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
           step_count = 0;
           if (ramping_factor >= MAX_RAMPING_FACTOR)
           {
-            /* Finished 100 steps at the slowest speed: reverse and ramp up again.
+            /* Finished <STEPS_PER_DIRECTION_RAMPING> steps at the slowest speed: reverse and ramp up again.
                ARR is already at 32x, so ramp-up starts at the right speed. */
             ramping_factor = MAX_RAMPING_FACTOR;
             HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* DIR */
