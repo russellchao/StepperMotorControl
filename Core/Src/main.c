@@ -32,7 +32,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-// The max and min clock ticks that the motor moves between
+// The max and min clock ticks that the motor moves between. Cruising occurs at MIN_STEP_INTERVAL
 #define MAX_STEP_INTERVAL 100U
 #define MIN_STEP_INTERVAL 20U
 #define STEPS_PER_DIRECTION_CRUISE 15000U
@@ -59,8 +59,9 @@ typedef enum
 } motion_state_t;
 
 volatile motion_state_t motion_state = MOTION_RAMP_UP;
-volatile uint32_t step_count = 0;                     /* shared with ISR, so volatile */
-volatile uint32_t ramping_factor = MAX_RAMPING_FACTOR; /* 1 = full speed, 32 = slowest */
+volatile uint32_t step_interval = MAX_STEP_INTERVAL;
+volatile uint32_t ticks_between_intervals = 0;
+volatile uint32_t cruise_step_count = 0;               /* shared with ISR, so volatile */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -70,7 +71,6 @@ static void MX_DAC1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-static void set_step_period(uint32_t factor);
 
 /* USER CODE END PFP */
 
@@ -114,12 +114,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
 
-  /* Start ramp-up at 32x slower than normal (ARR = 1000*32 - 1 = 31999, fits in 16 bits).
-     Done BEFORE starting the timer so the very first step is already slow. */
-  set_step_period(ramping_factor);
-
-//  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-//  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start_IT(&htim2, TIM_CHANNEL_1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -234,6 +230,8 @@ static void MX_TIM1_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
   /* USER CODE BEGIN TIM1_Init 1 */
 
@@ -254,6 +252,10 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
@@ -261,9 +263,36 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
+  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM1_Init 2 */
 
   /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
 
 }
 
@@ -346,83 +375,57 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /**
-  * Set TIM1's step period to `factor` times the normal 1 ms period.
-  * factor = 1 -> 1 kHz, factor = 32 -> 31.25 Hz.
-  * Called from the CC1 callback, where CNT ~= 500 and the new ARR is always
-  * >= 999, so the counter can never be past the new ARR (no 0xFFFF wrap).
-  */
-static void set_step_period(uint32_t factor)
-{
-  /* Do NOT use htim1.Init.Period here: the macro below overwrites it with the
-     scaled value, so the factors would compound (31999 -> 511999 -> ...). */
-  __HAL_TIM_SET_AUTORELOAD(&htim1, (STEP_BASE_PERIOD_TICKS * factor) - 1U);
-}
-
-/**
   * Called on TIM1 CH1 compare match, i.e. the falling edge of each STEP pulse.
   * Toggling DIR here (not at the rising edge) gives the driver plenty of
   * DIR setup time before the next step.
   *
   * One full cycle per direction:
-  *   RAMP_UP   : 50 steps each at 32x, 16x, 8x, 4x, 2x slower
-  *   CRUISE    : 3000 steps at 1 kHz
-  *   RAMP_DOWN : 50 steps each at 2x, 4x, 8x, 16x, 32x slower
+  *   RAMP_UP   : One step between step intervals of 100 -> 20
+  *   CRUISE    : 15000 steps at a step interval of 20 (3 seconds)
+  *   RAMP_DOWN : One step between step intervals of 20 -> 100
   *   -> toggle DIR (while slowest) -> back to RAMP_UP
   */
-void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
+void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
-    step_count++;
+	  ticks_between_intervals++;
+	  if (ticks_between_intervals >= step_interval)
+	  {
+		  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET);	/* PUL */
+		  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_RESET);
+		  ticks_between_intervals = 0;
+	  }
 
-    switch (motion_state)
-    {
-      case MOTION_RAMP_UP:
-        if (step_count >= STEPS_PER_DIRECTION_RAMPING)
-        {
-          step_count = 0;
-          ramping_factor >>= 1;              /* double the frequency */
-          set_step_period(ramping_factor);
-          if (ramping_factor <= 1U)
-          {
-            ramping_factor = 1U;
-            motion_state = MOTION_CRUISE;    /* now at 1 kHz */
-          }
-        }
-        break;
+	  switch (motion_state)
+	  {
+		  case MOTION_RAMP_UP:
+			  step_interval--;
+			  if (step_interval <= MIN_STEP_INTERVAL)
+				  motion_state = MOTION_CRUISE;
+			  break;
 
-      case MOTION_CRUISE:
-        if (step_count >= STEPS_PER_DIRECTION)
-        {
-          step_count = 0;
-          ramping_factor <<= 1;              /* first ramp-down stage: half speed */
-          set_step_period(ramping_factor);
-          motion_state = MOTION_RAMP_DOWN;
-        }
-        break;
+		  case MOTION_CRUISE:
+			  if (cruise_step_count >= STEPS_PER_DIRECTION_CRUISE)
+			  {
+				  cruise_step_count = 0;
+				  motion_state = MOTION_RAMP_DOWN;
+			  } else {
+				  cruise_step_count++;
+			  }
+			  break;
 
-      case MOTION_RAMP_DOWN:
-        if (step_count >= STEPS_PER_DIRECTION_RAMPING)
-        {
-          step_count = 0;
-          if (ramping_factor >= MAX_RAMPING_FACTOR)
-          {
-            /* Finished <STEPS_PER_DIRECTION_RAMPING> steps at the slowest speed: reverse and ramp up again.
-               ARR is already at 32x, so ramp-up starts at the right speed. */
-            ramping_factor = MAX_RAMPING_FACTOR;
-            HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* DIR */
-            motion_state = MOTION_RAMP_UP;
-          }
-          else
-          {
-            ramping_factor <<= 1;            /* halve the frequency */
-            set_step_period(ramping_factor);
-          }
-        }
-        break;
+		  case MOTION_RAMP_DOWN:
+			  step_interval++;
+			  if (step_interval >= MAX_STEP_INTERVAL)
+			  {
+				  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* DIR */
+				  motion_state = MOTION_RAMP_UP;
+			  }
+			  break;
 
-      default:
-        break;
+		  default:
+			  break;
     }
   }
 }
