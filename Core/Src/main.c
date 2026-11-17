@@ -33,9 +33,9 @@
 /* USER CODE BEGIN PD */
 
 // The max and min clock ticks that the motor moves between. Cruising occurs at MIN_STEP_INTERVAL
-#define MAX_STEP_INTERVAL 100U
+#define MAX_STEP_INTERVAL 200U
 #define MIN_STEP_INTERVAL 20U
-#define STEPS_PER_DIRECTION_CRUISE 15000U
+#define STEPS_PER_DIRECTION_CRUISE 2000U
 
 /* USER CODE END PD */
 
@@ -239,7 +239,7 @@ static void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 71;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 9;
+  htim1.Init.Period = 99;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -380,54 +380,55 @@ static void MX_GPIO_Init(void)
   * DIR setup time before the next step.
   *
   * One full cycle per direction:
-  *   RAMP_UP   : One step between step intervals of 100 -> 20
-  *   CRUISE    : 15000 steps at a step interval of 20 (3 seconds)
-  *   RAMP_DOWN : One step between step intervals of 20 -> 100
+  *   RAMP_UP   :
+  *   CRUISE    :
+  *   RAMP_DOWN :
   *   -> toggle DIR (while slowest) -> back to RAMP_UP
   */
 void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+  if (htim->Instance == TIM1 || htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
 	  ticks_between_intervals++;
-	  if (ticks_between_intervals >= step_interval)
-	  {
-		  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET);	/* PUL */
-		  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_RESET);
-		  ticks_between_intervals = 0;
-	  }
+
+	  /* End the PUL pulse one tick (100 microseconds) after it started */
+	  if (ticks_between_intervals == 1)
+		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+
+	  if (ticks_between_intervals < step_interval)
+		return;
+
+	  /* ---- one step ---- */
+	  ticks_between_intervals = 0;
+	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);      /* PUL rising edge */
 
 	  switch (motion_state)
 	  {
-		  case MOTION_RAMP_UP:
-			  step_interval--;
-			  if (step_interval <= MIN_STEP_INTERVAL)
-				  motion_state = MOTION_CRUISE;
-			  break;
+		case MOTION_RAMP_UP:
+		  if (--step_interval <= MIN_STEP_INTERVAL)
+			motion_state = MOTION_CRUISE;
+		  break;
 
-		  case MOTION_CRUISE:
-			  if (cruise_step_count >= STEPS_PER_DIRECTION_CRUISE)
-			  {
-				  cruise_step_count = 0;
-				  motion_state = MOTION_RAMP_DOWN;
-			  } else {
-				  cruise_step_count++;
-			  }
-			  break;
+		case MOTION_CRUISE:
+		  if (++cruise_step_count >= STEPS_PER_DIRECTION_CRUISE)
+		  {
+			cruise_step_count = 0;
+			motion_state = MOTION_RAMP_DOWN;
+		  }
+		  break;
 
-		  case MOTION_RAMP_DOWN:
-			  step_interval++;
-			  if (step_interval >= MAX_STEP_INTERVAL)
-			  {
-				  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* DIR */
-				  motion_state = MOTION_RAMP_UP;
-			  }
-			  break;
+		case MOTION_RAMP_DOWN:
+		  if (++step_interval >= MAX_STEP_INTERVAL)
+		  {
+			HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);             /* DIR */
+			motion_state = MOTION_RAMP_UP;
+		  }
+		  break;
 
-		  default:
-			  break;
-    }
-  }
+		default:
+		  break;
+	  }
+ }
 }
 
 /* USER CODE END 4 */
