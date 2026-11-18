@@ -32,7 +32,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-// The max and min clock ticks that the motor moves between. Cruising occurs at MIN_STEP_INTERVAL
+// The max and min clock ticks that the motor moves between. Cruising occurs at MIN_STEP_INTERVAL.
 #define MAX_STEP_INTERVAL 200U
 #define MIN_STEP_INTERVAL 20U
 #define STEPS_PER_DIRECTION_CRUISE 2000U
@@ -62,6 +62,9 @@ volatile motion_state_t motion_state = MOTION_RAMP_UP;
 volatile uint32_t step_interval = MAX_STEP_INTERVAL;
 volatile uint32_t ticks_between_intervals = 0;
 volatile uint32_t cruise_step_count = 0;               /* shared with ISR, so volatile */
+
+volatile uint32_t secondary_ticks = 0;
+volatile uint32_t secondary_step_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -310,6 +313,7 @@ static void MX_TIM2_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
 
   /* USER CODE BEGIN TIM2_Init 1 */
 
@@ -317,7 +321,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 71;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 999;
+  htim2.Init.Period = 99;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -329,15 +333,28 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_OC_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
+  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_OC_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM2_Init 2 */
 
   /* USER CODE END TIM2_Init 2 */
+  HAL_TIM_MspPostInit(&htim2);
 
 }
 
@@ -359,10 +376,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PA0 PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_5;
+  /*Configure GPIO pins : PA0 PA1 PA5 PA6 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_5|GPIO_PIN_6;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -375,7 +392,7 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /**
-  * Called on TIM1 CH1 compare match, i.e. the falling edge of each STEP pulse.
+  * Called on TIM1 CH1 and TIM2 CH1 compare match, i.e. the falling edge of each STEP pulse.
   * Toggling DIR here (not at the rising edge) gives the driver plenty of
   * DIR setup time before the next step.
   *
@@ -387,8 +404,10 @@ static void MX_GPIO_Init(void)
   */
 void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  if (htim->Instance == TIM1 || htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+  if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
+	  /* Main motor interrupt */
+
 	  ticks_between_intervals++;
 
 	  /* End the PUL pulse one tick (100 microseconds) after it started */
@@ -428,7 +447,34 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 		default:
 		  break;
 	  }
- }
+  }
+
+  if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+  {
+	  /* Secondary motor interrupt */
+
+	  /*
+	   * For now, it just moves constantly at 4,000 steps (8secs) per direction per MIN_STEP_INTERVAL ticks. No ramping.
+	   */
+
+	  secondary_ticks++;
+	  if (secondary_ticks == 1)
+		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+
+	  if (secondary_ticks < MIN_STEP_INTERVAL)
+		return;
+
+	  secondary_ticks = 0;
+	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);	/* PUL rising edge */
+
+	  if (++secondary_step_count >= 4000U)
+	  {
+		  secondary_step_count = 0;
+		  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6);             /* DIR */
+	  }
+
+
+  }
 }
 
 /* USER CODE END 4 */
