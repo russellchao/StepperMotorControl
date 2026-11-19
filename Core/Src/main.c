@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <stdlib.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -37,6 +38,17 @@
 #define MIN_STEP_INTERVAL 20U
 #define STEPS_PER_DIRECTION_CRUISE 2000U
 
+#define OCT_BASE_TICKS_PER_STEP 20U
+#define OCT_BASE_STEPS_PER_D 300U
+
+#define OCT_LEN 9U   /* 8 vertices + closing point (same as the first) */
+
+/* Pins */
+#define X_PUL_PIN GPIO_PIN_0
+#define Y_PUL_PIN GPIO_PIN_1
+#define X_DIR_PIN GPIO_PIN_5
+#define Y_DIR_PIN GPIO_PIN_6
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,6 +63,8 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
+
+/* Ramping (not used right now) */
 typedef enum
 {
   MOTION_RAMP_UP,
@@ -65,6 +79,21 @@ volatile uint32_t cruise_step_count = 0;               /* shared with ISR, so vo
 
 volatile uint32_t secondary_ticks = 0;
 volatile uint32_t secondary_step_count = 0;
+
+/* Drawing an Octagon */
+static const int32_t oct_x[OCT_LEN] = {1, 3, 4, 4, 3, 1, 0, 0, 1}; // Note: The last index is the same as the first
+static const int32_t oct_y[OCT_LEN] = {0, 0, 3, 5, 8, 8, 5, 3, 0};
+
+volatile int32_t oct_current_stage = 0;
+volatile int32_t oct_x_ticks_per_step = 0;
+volatile int32_t oct_y_ticks_per_step = 0;
+
+/* Per-segment progress. Step counts are exact; tick intervals may be rounded. */
+volatile uint32_t oct_x_steps_left = 0;
+volatile uint32_t oct_y_steps_left = 0;
+volatile int32_t  oct_x_tick_count = 0;
+volatile int32_t  oct_y_tick_count = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -74,6 +103,8 @@ static void MX_DAC1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
+static void set_ticks_per_xy_step(int32_t dx, int32_t dy);
+static void oct_start_segment(int32_t stage);
 
 /* USER CODE END PFP */
 
@@ -117,8 +148,14 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
 
+  /* Load the first segment (sets DIR pins) before the timer starts ticking.
+     Assumes the pen starts at (oct_x[0], oct_y[0]). */
+  oct_current_stage = 0;
+  oct_start_segment(oct_current_stage);
+
   HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start_IT(&htim2, TIM_CHANNEL_1);
+  /* TIM2 not started: TIM1 now drives both axes so they share one time base. */
+  // HAL_TIM_PWM_Start_IT(&htim2, TIM_CHANNEL_1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -391,6 +428,53 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void set_ticks_per_xy_step(int32_t dx, int32_t dy)
+{
+  const int32_t base = (int32_t)OCT_BASE_TICKS_PER_STEP;
+  int32_t adx = abs(dx);
+  int32_t ady = abs(dy);
+
+  if (adx == 0 && ady == 0)            /* no movement */
+  {
+    oct_x_ticks_per_step = 0;
+    oct_y_ticks_per_step = 0;
+    return;
+  }
+
+  if (adx >= ady)                      /* X is the major axis */
+  {
+    oct_x_ticks_per_step = base;
+    oct_y_ticks_per_step = (ady == 0) ? 0 : (base * adx + ady / 2) / ady;  /* rounded */
+  }
+  else                                 /* Y is the major axis */
+  {
+    oct_y_ticks_per_step = base;
+    oct_x_ticks_per_step = (adx == 0) ? 0 : (base * ady + adx / 2) / adx;  /* rounded */
+  }
+}
+
+/**
+  * Load segment `stage` -> `stage + 1`: set DIR pins, exact step counts,
+  * and (possibly rounded) tick intervals. Call only while PUL pins are low.
+  * Flip the SET/RESET choice for an axis if it moves the wrong way.
+  */
+static void oct_start_segment(int32_t stage)
+{
+  int32_t dx = oct_x[stage + 1] - oct_x[stage];
+  int32_t dy = oct_y[stage + 1] - oct_y[stage];
+
+  HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, (dx >= 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, Y_DIR_PIN, (dy >= 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+  oct_x_steps_left = (uint32_t)abs(dx) * OCT_BASE_STEPS_PER_D;
+  oct_y_steps_left = (uint32_t)abs(dy) * OCT_BASE_STEPS_PER_D;
+
+  set_ticks_per_xy_step(dx, dy);
+
+  oct_x_tick_count = 0;
+  oct_y_tick_count = 0;
+}
+
 /**
   * Called on TIM1 CH1 and TIM2 CH1 compare match, i.e. the falling edge of each STEP pulse.
   * Toggling DIR here (not at the rising edge) gives the driver plenty of
@@ -406,74 +490,45 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
-	  /* Main motor interrupt */
+	  /* Main interrupt: fires every tick (100 microseconds) and drives BOTH axes. */
 
-	  ticks_between_intervals++;
+	  /* 1. End any PUL pulse started on the previous tick (pulse width = 1 tick). */
+	  HAL_GPIO_WritePin(GPIOA, X_PUL_PIN | Y_PUL_PIN, GPIO_PIN_RESET);
 
-	  /* End the PUL pulse one tick (100 microseconds) after it started */
-	  if (ticks_between_intervals == 1)
-		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
-
-	  if (ticks_between_intervals < step_interval)
-		return;
-
-	  /* ---- one step ---- */
-	  ticks_between_intervals = 0;
-	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);      /* PUL rising edge */
-
-	  switch (motion_state)
+	  /* 2. Segment finished? Both axes must have taken their exact step count.
+	        Done here, with PUL low, so DIR changes a full tick before the next
+	        rising edge. */
+	  if (oct_x_steps_left == 0 && oct_y_steps_left == 0)
 	  {
-		case MOTION_RAMP_UP:
-		  if (--step_interval <= MIN_STEP_INTERVAL)
-			motion_state = MOTION_CRUISE;
-		  break;
-
-		case MOTION_CRUISE:
-		  if (++cruise_step_count >= STEPS_PER_DIRECTION_CRUISE)
-		  {
-			cruise_step_count = 0;
-			motion_state = MOTION_RAMP_DOWN;
-		  }
-		  break;
-
-		case MOTION_RAMP_DOWN:
-		  if (++step_interval >= MAX_STEP_INTERVAL)
-		  {
-			HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);             /* DIR */
-			motion_state = MOTION_RAMP_UP;
-		  }
-		  break;
-
-		default:
-		  break;
+		  oct_current_stage++;
+		  if (oct_current_stage >= (int32_t)(OCT_LEN - 1))
+			  oct_current_stage = 0;               /* back at the start: draw again */
+		  oct_start_segment(oct_current_stage);
+		  return;
 	  }
+
+	  /* 3. X axis: step when its interval elapses, until its steps run out. */
+	  if (oct_x_steps_left > 0 && ++oct_x_tick_count >= oct_x_ticks_per_step)
+	  {
+		  oct_x_tick_count = 0;
+		  HAL_GPIO_WritePin(GPIOA, X_PUL_PIN, GPIO_PIN_SET);   /* rising edge */
+		  oct_x_steps_left--;
+	  }
+
+	  /* 4. Y axis: same, with its own interval and count. */
+	  if (oct_y_steps_left > 0 && ++oct_y_tick_count >= oct_y_ticks_per_step)
+	  {
+		  oct_y_tick_count = 0;
+		  HAL_GPIO_WritePin(GPIOA, Y_PUL_PIN, GPIO_PIN_SET);
+		  oct_y_steps_left--;
+	  }
+
+	  return;
   }
 
   if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
 	  /* Secondary motor interrupt */
-
-	  /*
-	   * For now, it just moves constantly at 4,000 steps (8secs) per direction per MIN_STEP_INTERVAL ticks. No ramping.
-	   */
-
-	  secondary_ticks++;
-	  if (secondary_ticks == 1)
-		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
-
-	  if (secondary_ticks < MIN_STEP_INTERVAL)
-		return;
-
-	  secondary_ticks = 0;
-	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);	/* PUL rising edge */
-
-	  if (++secondary_step_count >= 4000U)
-	  {
-		  secondary_step_count = 0;
-		  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6);             /* DIR */
-	  }
-
-
   }
 }
 
