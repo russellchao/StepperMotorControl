@@ -40,6 +40,7 @@
 
 #define OCT_BASE_TICKS_PER_STEP 20U
 #define OCT_BASE_STEPS_PER_D 300U
+#define SOLENOID_DELAY 10000U
 
 #define OCT_LEN 9U   /* 8 vertices + closing point (same as the first) */
 
@@ -48,6 +49,7 @@
 #define Y_PUL_PIN GPIO_PIN_1
 #define X_DIR_PIN GPIO_PIN_5
 #define Y_DIR_PIN GPIO_PIN_6
+#define SOLENOID_PIN GPIO_PIN_7
 
 /* USER CODE END PD */
 
@@ -93,6 +95,8 @@ volatile uint32_t oct_x_steps_left = 0;
 volatile uint32_t oct_y_steps_left = 0;
 volatile int32_t  oct_x_tick_count = 0;
 volatile int32_t  oct_y_tick_count = 0;
+
+volatile int32_t solenoid_tick_count = 0;
 
 /* USER CODE END PV */
 
@@ -152,6 +156,8 @@ int main(void)
      Assumes the pen starts at (oct_x[0], oct_y[0]). */
   oct_current_stage = 0;
   oct_start_segment(oct_current_stage);
+
+  solenoid_tick_count = 0;
 
   HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_1);
   /* TIM2 not started: TIM1 now drives both axes so they share one time base. */
@@ -413,10 +419,13 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_5|GPIO_PIN_6
+                          |GPIO_PIN_7, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PA0 PA1 PA5 PA6 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_5|GPIO_PIN_6;
+  /*Configure GPIO pins : PA0 PA1 PA5 PA6
+                           PA7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_5|GPIO_PIN_6
+                          |GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -500,10 +509,32 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 	        rising edge. */
 	  if (oct_x_steps_left == 0 && oct_y_steps_left == 0)
 	  {
-		  oct_current_stage++;
-		  if (oct_current_stage >= (int32_t)(OCT_LEN - 1))
-			  oct_current_stage = 0;               /* back at the start: draw again */
+		  if (oct_current_stage + 1 >= (int32_t)(OCT_LEN - 1))
+		  {
+			  /* Back at the start. Introduce a 1s delay (10000 ticks) for the solenoid pen to rise/drop.
+			   * The pen will draw every other cycle while it's dropped. */
+			  if (solenoid_tick_count < SOLENOID_DELAY)
+			  {
+				  // During delay
+				  if (solenoid_tick_count == 0)
+					  HAL_GPIO_TogglePin(GPIOA, SOLENOID_PIN);
+				  solenoid_tick_count++;
+				  return;
+			  }
+			  else
+			  {
+				  // End of delay
+				  oct_current_stage = 0;
+				  solenoid_tick_count = 0;
+			  }
+
+		  }
+		  else
+		  {
+			  oct_current_stage++;
+		  }
 		  oct_start_segment(oct_current_stage);
+
 		  return;
 	  }
 
