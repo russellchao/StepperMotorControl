@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include <stdlib.h>
+#include <stdbool.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -32,12 +33,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
-// The max and min clock ticks that the motor moves between. Cruising occurs at MIN_STEP_INTERVAL.
-#define MAX_STEP_INTERVAL 200U
-#define MIN_STEP_INTERVAL 20U
-#define STEPS_PER_DIRECTION_CRUISE 2000U
-
 #define OCT_BASE_TICKS_PER_STEP 20U
 #define OCT_BASE_STEPS_PER_D 300U
 #define SOLENOID_DELAY 10000U
@@ -49,7 +44,10 @@
 #define Y_PUL_PIN GPIO_PIN_1
 #define X_DIR_PIN GPIO_PIN_5
 #define Y_DIR_PIN GPIO_PIN_6
+#define X_OPTICAL_PIN GPIO_PIN_8
+#define Y_OPTICAL_PIN GPIO_PIN_9
 #define SOLENOID_PIN GPIO_PIN_7
+
 
 /* USER CODE END PD */
 
@@ -62,27 +60,14 @@
 DAC_HandleTypeDef hdac1;
 
 TIM_HandleTypeDef htim1;
-TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
+volatile bool x_init_phase1, x_init_phase2;
+volatile bool y_init_phase1, y_init_phase2;
 
-/* Ramping (not used right now) */
-typedef enum
-{
-  MOTION_RAMP_UP,
-  MOTION_CRUISE,
-  MOTION_RAMP_DOWN
-} motion_state_t;
+volatile int32_t x_pos = 0;
+volatile int32_t y_pos = 0;
 
-volatile motion_state_t motion_state = MOTION_RAMP_UP;
-volatile uint32_t step_interval = MAX_STEP_INTERVAL;
-volatile uint32_t ticks_between_intervals = 0;
-volatile uint32_t cruise_step_count = 0;               /* shared with ISR, so volatile */
-
-volatile uint32_t secondary_ticks = 0;
-volatile uint32_t secondary_step_count = 0;
-
-/* Drawing an Octagon */
 static const int32_t oct_x[OCT_LEN] = {1, 3, 4, 4, 3, 1, 0, 0, 1}; // Note: The last index is the same as the first
 static const int32_t oct_y[OCT_LEN] = {0, 0, 3, 5, 8, 8, 5, 3, 0};
 
@@ -105,8 +90,9 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DAC1_Init(void);
 static void MX_TIM1_Init(void);
-static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
+static void initialize_x_motor();
+static void initialize_y_motor();
 static void set_ticks_per_xy_step(int32_t dx, int32_t dy);
 static void oct_start_segment(int32_t stage);
 
@@ -148,9 +134,17 @@ int main(void)
   MX_GPIO_Init();
   MX_DAC1_Init();
   MX_TIM1_Init();
-  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
+
+  /* Raise the solenoid pin and don't let the motors move on startup */
+  HAL_GPIO_WritePin(GPIOA, X_PUL_PIN, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, Y_PUL_PIN, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, SOLENOID_PIN, GPIO_PIN_RESET);
+
+  /* Move the motors to their respective starting position */
+  initialize_x_motor();
+  initialize_y_motor();
 
   /* Load the first segment (sets DIR pins) before the timer starts ticking.
      Assumes the pen starts at (oct_x[0], oct_y[0]). */
@@ -160,8 +154,6 @@ int main(void)
   solenoid_tick_count = 0;
 
   HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_1);
-  /* TIM2 not started: TIM1 now drives both axes so they share one time base. */
-  // HAL_TIM_PWM_Start_IT(&htim2, TIM_CHANNEL_1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -213,9 +205,8 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_TIM1|RCC_PERIPHCLK_TIM2;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_TIM1;
   PeriphClkInit.Tim1ClockSelection = RCC_TIM1CLK_HCLK;
-  PeriphClkInit.Tim2ClockSelection = RCC_TIM2CLK_HCLK;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
@@ -343,65 +334,6 @@ static void MX_TIM1_Init(void)
 }
 
 /**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 71;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 99;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_OC_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_OC_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
-  HAL_TIM_MspPostInit(&htim2);
-
-}
-
-/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -431,12 +363,62 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : PA8 PA9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+static void initialize_x_motor()
+{
+	x_init_phase1 = true;
+	x_init_phase2 = false;
+	oct_x_steps_left = OCT_BASE_STEPS_PER_D;
+
+	// Phase 1: First, move the X motor away from the optical sensor (positive X) for <OCT_BASE_STEPS_PER_D> steps.
+	// Note: the X motor moves in the positive direction (right) when X_DIR_PIN is LOW, and vice versa.
+	HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOA, X_PUL_PIN, GPIO_PIN_SET);
+	while (x_init_phase1)
+	{
+		if (oct_x_steps_left == 0)
+		{
+			x_init_phase1 = false;
+			x_init_phase2 = true;
+		}
+		else
+		{
+			oct_x_steps_left--;
+		}
+	}
+
+	// Phase 2: Then, move the X motor towards the X optical sensor (negative X, left) until X_OPITCAL_PIN reads HIGH.
+	HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, GPIO_PIN_SET);
+	while (x_init_phase2)
+	{
+		if (HAL_GPIO_ReadPin(GPIOA, X_OPTICAL_PIN) == GPIO_PIN_SET)
+		{
+			HAL_GPIO_WritePin(GPIOA, X_PUL_PIN, GPIO_PIN_RESET);
+			x_pos = 0;
+			x_init_phase2 = false;
+		}
+	}
+}
+
+static void initialize_y_motor()
+{
+	// First, move the Y motor away from the optical sensor (positive Y) for <OCT_BASE_STEPS_PER_D> steps.
+	// Note: the Y motor moves in the positive direction (up) when Y_DIR_PIN is LOW, and vice versa.
+
+	// Then, move the Y motor towards the Y optical sensor (negative Y, down) until Y_OPITCAL_PIN reads HIGH.
+}
+
 static void set_ticks_per_xy_step(int32_t dx, int32_t dy)
 {
   const int32_t base = (int32_t)OCT_BASE_TICKS_PER_STEP;
@@ -472,8 +454,8 @@ static void oct_start_segment(int32_t stage)
   int32_t dx = oct_x[stage + 1] - oct_x[stage];
   int32_t dy = oct_y[stage + 1] - oct_y[stage];
 
-  HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, (dx >= 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOA, Y_DIR_PIN, (dy >= 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, (dx >= 0) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOA, Y_DIR_PIN, (dy >= 0) ? GPIO_PIN_RESET : GPIO_PIN_SET);
 
   oct_x_steps_left = (uint32_t)abs(dx) * OCT_BASE_STEPS_PER_D;
   oct_y_steps_left = (uint32_t)abs(dy) * OCT_BASE_STEPS_PER_D;
@@ -485,15 +467,9 @@ static void oct_start_segment(int32_t stage)
 }
 
 /**
-  * Called on TIM1 CH1 and TIM2 CH1 compare match, i.e. the falling edge of each STEP pulse.
+  * Called on TIM1 CH1 compare match, i.e. the falling edge of each STEP pulse.
   * Toggling DIR here (not at the rising edge) gives the driver plenty of
   * DIR setup time before the next step.
-  *
-  * One full cycle per direction:
-  *   RAMP_UP   :
-  *   CRUISE    :
-  *   RAMP_DOWN :
-  *   -> toggle DIR (while slowest) -> back to RAMP_UP
   */
 void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -503,6 +479,7 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 
 	  /* 1. End any PUL pulse started on the previous tick (pulse width = 1 tick). */
 	  HAL_GPIO_WritePin(GPIOA, X_PUL_PIN | Y_PUL_PIN, GPIO_PIN_RESET);
+
 
 	  /* 2. Segment finished? Both axes must have taken their exact step count.
 	        Done here, with PUL low, so DIR changes a full tick before the next
@@ -555,11 +532,6 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 	  }
 
 	  return;
-  }
-
-  if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
-  {
-	  /* Secondary motor interrupt */
   }
 }
 
