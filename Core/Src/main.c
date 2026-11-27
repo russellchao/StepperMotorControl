@@ -33,11 +33,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define OCT_BASE_TICKS_PER_STEP 20U
+#define OCT_BASE_TICKS_PER_STEP 45U
 #define OCT_BASE_STEPS_PER_D 300U
 #define SOLENOID_DELAY 10000U
 
 #define OCT_LEN 9U   /* 8 vertices + closing point (same as the first) */
+
+#define HOME_MAX_STEPS 20000U   /* safety limit so homing can't hang forever */
 
 /* Pins */
 #define X_PUL_PIN GPIO_PIN_0
@@ -68,8 +70,12 @@ volatile bool y_init_phase1, y_init_phase2;
 volatile int32_t x_pos = 0;
 volatile int32_t y_pos = 0;
 
-static const int32_t oct_x[OCT_LEN] = {1, 3, 4, 4, 3, 1, 0, 0, 1}; // Note: The last index is the same as the first
-static const int32_t oct_y[OCT_LEN] = {0, 0, 3, 5, 8, 8, 5, 3, 0};
+//static const int32_t oct_x[OCT_LEN] = {1, 3, 4, 4, 3, 1, 0, 0, 1}; // Note: The last index is the same as the first
+//static const int32_t oct_y[OCT_LEN] = {0, 0, 3, 5, 8, 8, 5, 3, 0};
+
+#define TEMP_LEN 3U
+static const int32_t oct_x[TEMP_LEN] = {1, 1, 1}; // Note: The last index is the same as the first
+static const int32_t oct_y[TEMP_LEN] = {0, 20, 0};
 
 volatile int32_t oct_current_stage = 0;
 volatile int32_t oct_x_ticks_per_step = 0;
@@ -143,8 +149,8 @@ int main(void)
   HAL_GPIO_WritePin(GPIOA, SOLENOID_PIN, GPIO_PIN_RESET);
 
   /* Move the motors to their respective starting position */
-  initialize_x_motor();
-  initialize_y_motor();
+  // initialize_x_motor();
+  // initialize_y_motor();
 
   /* Load the first segment (sets DIR pins) before the timer starts ticking.
      Assumes the pen starts at (oct_x[0], oct_y[0]). */
@@ -375,48 +381,66 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-static void initialize_x_motor()
+static void motor_init_step_once(uint16_t PUL_pin)
 {
-	x_init_phase1 = true;
-	x_init_phase2 = false;
-	oct_x_steps_left = OCT_BASE_STEPS_PER_D;
-
-	// Phase 1: First, move the X motor away from the optical sensor (positive X) for <OCT_BASE_STEPS_PER_D> steps.
-	// Note: the X motor moves in the positive direction (right) when X_DIR_PIN is LOW, and vice versa.
-	HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(GPIOA, X_PUL_PIN, GPIO_PIN_SET);
-	while (x_init_phase1)
-	{
-		if (oct_x_steps_left == 0)
-		{
-			x_init_phase1 = false;
-			x_init_phase2 = true;
-		}
-		else
-		{
-			oct_x_steps_left--;
-		}
-	}
-
-	// Phase 2: Then, move the X motor towards the X optical sensor (negative X, left) until X_OPITCAL_PIN reads HIGH.
-	HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, GPIO_PIN_SET);
-	while (x_init_phase2)
-	{
-		if (HAL_GPIO_ReadPin(GPIOA, X_OPTICAL_PIN) == GPIO_PIN_SET)
-		{
-			HAL_GPIO_WritePin(GPIOA, X_PUL_PIN, GPIO_PIN_RESET);
-			x_pos = 0;
-			x_init_phase2 = false;
-		}
-	}
+    HAL_GPIO_WritePin(GPIOA, PUL_pin, GPIO_PIN_SET);    /* rising edge = 1 step */
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOA, PUL_pin, GPIO_PIN_RESET);
+    HAL_Delay(1);
 }
 
-static void initialize_y_motor()
+static void initialize_x_motor(void)
 {
-	// First, move the Y motor away from the optical sensor (positive Y) for <OCT_BASE_STEPS_PER_D> steps.
-	// Note: the Y motor moves in the positive direction (up) when Y_DIR_PIN is LOW, and vice versa.
+    /* Phase 1: move away from the sensor (+X, DIR LOW) */
+    HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, GPIO_PIN_RESET);
+    HAL_Delay(1);                                         /* DIR setup time */
+    for (uint32_t i = 0; i < OCT_BASE_STEPS_PER_D; i++)
+        motor_init_step_once(X_PUL_PIN);
 
-	// Then, move the Y motor towards the Y optical sensor (negative Y, down) until Y_OPITCAL_PIN reads HIGH.
+    /* Phase 2: move toward the sensor (-X, DIR HIGH) until it trips */
+    HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+    uint32_t steps = 0;
+    while (HAL_GPIO_ReadPin(GPIOA, X_OPTICAL_PIN) != GPIO_PIN_SET)
+    {
+        motor_init_step_once(X_PUL_PIN);
+        if (++steps > HOME_MAX_STEPS)
+            Error_Handler();                              /* sensor never tripped */
+    }
+
+    HAL_GPIO_WritePin(GPIOA, X_DIR_PIN, GPIO_PIN_RESET);
+    	HAL_Delay(1);                                         /* DIR setup time */
+    	for (uint32_t i = 0; i < 4000; i++)
+    		motor_init_step_once(X_PUL_PIN);
+
+    x_pos = 0;
+}
+
+static void initialize_y_motor(void)
+{
+	/* Phase 1: move away from the sensor (+Y, DIR LOW) */
+	HAL_GPIO_WritePin(GPIOA, Y_DIR_PIN, GPIO_PIN_RESET);
+	HAL_Delay(1);                                         /* DIR setup time */
+	for (uint32_t i = 0; i < OCT_BASE_STEPS_PER_D; i++)
+		motor_init_step_once(Y_PUL_PIN);
+
+	/* Phase 2: move toward the sensor (-Y, DIR HIGH) until it trips */
+	HAL_GPIO_WritePin(GPIOA, Y_DIR_PIN, GPIO_PIN_SET);
+	HAL_Delay(1);
+	uint32_t steps = 0;
+	while (HAL_GPIO_ReadPin(GPIOA, Y_OPTICAL_PIN) != GPIO_PIN_SET)
+	{
+		motor_init_step_once(Y_PUL_PIN);
+		if (++steps > HOME_MAX_STEPS)
+			Error_Handler();                              /* sensor never tripped */
+	}
+
+	HAL_GPIO_WritePin(GPIOA, Y_DIR_PIN, GPIO_PIN_RESET);
+	HAL_Delay(1);                                         /* DIR setup time */
+	for (uint32_t i = 0; i < 5000; i++)
+		motor_init_step_once(Y_PUL_PIN);
+
+	y_pos = 20;
 }
 
 static void set_ticks_per_xy_step(int32_t dx, int32_t dy)
@@ -486,7 +510,7 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 	        rising edge. */
 	  if (oct_x_steps_left == 0 && oct_y_steps_left == 0)
 	  {
-		  if (oct_current_stage + 1 >= (int32_t)(OCT_LEN - 1))
+		  if (oct_current_stage + 1 >= (int32_t)(TEMP_LEN - 1))
 		  {
 			  /* Back at the start. Introduce a 1s delay (10000 ticks) for the solenoid pen to rise/drop.
 			   * The pen will draw every other cycle while it's dropped. */
