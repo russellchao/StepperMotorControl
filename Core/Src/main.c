@@ -33,8 +33,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define OCT_BASE_TICKS_PER_STEP 45U
-#define OCT_BASE_STEPS_PER_D 300U
+#define OCT_BASE_TICKS_PER_STEP 5U
+#define OCT_BASE_STEPS_PER_D 800U
 #define SOLENOID_DELAY 10000U
 
 #define OCT_LEN 9U   /* 8 vertices + closing point (same as the first) */
@@ -70,12 +70,8 @@ volatile bool y_init_phase1, y_init_phase2;
 volatile int32_t x_pos = 0;
 volatile int32_t y_pos = 0;
 
-//static const int32_t oct_x[OCT_LEN] = {1, 3, 4, 4, 3, 1, 0, 0, 1}; // Note: The last index is the same as the first
-//static const int32_t oct_y[OCT_LEN] = {0, 0, 3, 5, 8, 8, 5, 3, 0};
-
-#define TEMP_LEN 3U
-static const int32_t oct_x[TEMP_LEN] = {1, 1, 1}; // Note: The last index is the same as the first
-static const int32_t oct_y[TEMP_LEN] = {0, 20, 0};
+static const int32_t oct_x[OCT_LEN] = {1, 3, 4, 4, 3, 1, 0, 0, 1}; // Note: The last index is the same as the first
+static const int32_t oct_y[OCT_LEN] = {0, 0, 3, 5, 8, 8, 5, 3, 0};
 
 volatile int32_t oct_current_stage = 0;
 volatile int32_t oct_x_ticks_per_step = 0;
@@ -149,8 +145,8 @@ int main(void)
   HAL_GPIO_WritePin(GPIOA, SOLENOID_PIN, GPIO_PIN_RESET);
 
   /* Move the motors to their respective starting position */
-  // initialize_x_motor();
-  // initialize_y_motor();
+  initialize_x_motor();
+  initialize_y_motor();
 
   /* Load the first segment (sets DIR pins) before the timer starts ticking.
      Assumes the pen starts at (oct_x[0], oct_y[0]). */
@@ -510,7 +506,7 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 	        rising edge. */
 	  if (oct_x_steps_left == 0 && oct_y_steps_left == 0)
 	  {
-		  if (oct_current_stage + 1 >= (int32_t)(TEMP_LEN - 1))
+		  if (oct_current_stage + 1 >= (int32_t)(OCT_LEN - 1))
 		  {
 			  /* Back at the start. Introduce a 1s delay (10000 ticks) for the solenoid pen to rise/drop.
 			   * The pen will draw every other cycle while it's dropped. */
